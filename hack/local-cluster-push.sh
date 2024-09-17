@@ -17,8 +17,7 @@ if [ "${1:-}" = "-n" ]; then
     do_build=0
 fi
 
-registry=$(oc get -n openshift-image-registry -o json route/image-registry | jq -r ".spec.host")
-curl -k --head https://"${registry}" >/dev/null
+registry=default-route-openshift-image-registry.apps-crc.testing
 
 imgname=machine-config-operator
 LOCAL_IMGNAME=localhost/${imgname}:latest
@@ -27,19 +26,17 @@ if [ "${do_build}" = 1 ]; then
     ./hack/build-image
 fi
 
-if [[ "${podman:-}" =~ "docker" ]]; then
-  imgstorage="docker-daemon:"
-else
-  imgstorage="containers-storage:"
-fi
-skopeo login -u kubeadmin -p $(oc whoami -t) ${registry} --tls-verify=false
-skopeo copy --dest-tls-verify=false "${imgstorage}${LOCAL_IMGNAME}" "docker://${registry}/${REMOTE_IMGNAME}"
-digest=$(skopeo inspect --tls-verify=false docker://${registry}/${REMOTE_IMGNAME} | jq -r .Digest)
-imageid=${REMOTE_IMGNAME}@${digest}
+podman login -u kubeadmin -p $(oc whoami -t) default-route-openshift-image-registry.apps-crc.testing --tls-verify=false
+
+imageid=${REMOTE_IMGNAME}:latest
 
 oc project openshift-machine-config-operator
 
-IN_CLUSTER_NAME=image-registry.openshift-image-registry.svc:5000/${imageid}
+IN_CLUSTER_NAME=${registry}/${imageid}
+
+podman tag ${LOCAL_IMGNAME} ${IN_CLUSTER_NAME}
+podman push ${IN_CLUSTER_NAME} --tls-verify=false
+oc set image-lookup
 
 # Scale down the operator now to avoid it racing with our update.
 oc scale --replicas=0 deploy/machine-config-operator
