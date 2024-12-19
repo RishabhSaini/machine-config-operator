@@ -372,12 +372,19 @@ func (b *buildReconciler) startBuild(ctx context.Context, mosb *mcfgv1alpha1.Mac
 		return fmt.Errorf("could not delete other non-terminal MachineOSBuilds for MachineOSConfig %s: %w", mosc.Name, err)
 	}
 
-	// Next, create our new MachineOSBuild.
-	if err := imagebuilder.NewJobImageBuilder(b.kubeclient, b.mcfgclient, mosb, mosc).Start(ctx); err != nil {
-		return fmt.Errorf("imagebuilder could not start build for MachineOSBuild %q: %w", mosb.Name, err)
+	switch mosc.Spec.BuildInputs.ImageBuilder.ImageBuilderType {
+		case mcfgv1alpha1.PodBuilder:
+			// Next, create our new MachineOSBuild.
+			if err := imagebuilder.NewJobImageBuilder(b.kubeclient, b.mcfgclient, mosb, mosc).Start(ctx); err != nil {
+				return fmt.Errorf("imagebuilder could not start build for MachineOSBuild %q: %w", mosb.Name, err)
+			}
+		case mcfgv1alpha1.PipelineBuilder:
+			return fmt.Errorf("working on it")
+		default:
+			return fmt.Errorf("ImageBuilderType: %s is not supported", mosc.Spec.BuildInputs.ImageBuilder.ImageBuilderType)
 	}
-
-	klog.Infof("Started new build %s for MachineOSBuild", utils.GetBuildJobName(mosb))
+	
+	klog.Infof("Started new build %s for MachineOSBuild", utils.GetBuildName(mosb))
 
 	if err := b.updateMachineOSConfigStatus(ctx, mosc, mosb); err != nil {
 		return fmt.Errorf("could not update MachineOSConfig %q status for MachineOSBuild %q: %w", mosc.Name, mosb.Name, err)

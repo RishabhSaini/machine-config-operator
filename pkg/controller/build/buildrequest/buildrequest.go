@@ -601,7 +601,7 @@ func (br buildRequestImpl) getMCConfigMapName() string {
 
 // Computes the build name based upon the MachineConfigPool name.
 func (br buildRequestImpl) getBuildName() string {
-	return utils.GetBuildJobName(br.opts.MachineOSBuild)
+	return utils.GetBuildName(br.opts.MachineOSBuild)
 }
 
 func (br buildRequestImpl) getDigestConfigMapName() string {
