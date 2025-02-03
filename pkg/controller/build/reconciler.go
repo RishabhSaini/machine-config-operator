@@ -2,6 +2,7 @@ package build
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"strings"
 	"time"
@@ -14,15 +15,25 @@ import (
 	"github.com/openshift/machine-config-operator/pkg/controller/build/imagebuilder"
 	"github.com/openshift/machine-config-operator/pkg/controller/build/utils"
 	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
+	olmv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+	olmclientset "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
+	pipelineoperatorclientset "github.com/tektoncd/operator/pkg/client/clientset/versioned"
+	tektonv1beta1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
+	tektonclientset "github.com/tektoncd/pipeline/pkg/client/clientset/versioned"
 	batchv1 "k8s.io/api/batch/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
+	"knative.dev/pkg/apis"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+//go:embed buildrequest/assets/buildah-build-pipeline.sh
+var buildahBuildPipelineScript string
 
 const (
 	addingVerb   string = "Adding"
@@ -51,22 +62,28 @@ type reconciler interface {
 // is to respond to incoming events in a specific way. By doing this, the
 // reconciliation process has a clear entrypoint for each incoming event.
 type buildReconciler struct {
-	mcfgclient mcfgclientset.Interface
-	kubeclient clientset.Interface
+	mcfgclient             mcfgclientset.Interface
+	kubeclient             clientset.Interface
+	pipelineoperatorclient pipelineoperatorclientset.Interface
+	olmclient              olmclientset.Interface
+	tektonclient	       tektonclientset.Interface
 	*listers
 }
 
 // Instantiates a new reconciler instance. This returns an interface to
 // disallow access to its private methods.
-func newBuildReconciler(mcfgclient mcfgclientset.Interface, kubeclient clientset.Interface, l *listers) reconciler {
-	return newBuildReconcilerAsStruct(mcfgclient, kubeclient, l)
+func newBuildReconciler(mcfgclient mcfgclientset.Interface, kubeclient clientset.Interface, pipelineoperatorclient pipelineoperatorclientset.Interface, olmclient olmclientset.Interface, tektonclient tektonclientset.Interface, l *listers) reconciler {
+	return newBuildReconcilerAsStruct(mcfgclient, kubeclient, pipelineoperatorclient, olmclient, tektonclient, l)
 }
 
-func newBuildReconcilerAsStruct(mcfgclient mcfgclientset.Interface, kubeclient clientset.Interface, l *listers) *buildReconciler {
+func newBuildReconcilerAsStruct(mcfgclient mcfgclientset.Interface, kubeclient clientset.Interface, pipelineoperatorclient pipelineoperatorclientset.Interface, olmclient olmclientset.Interface, tektonclient tektonclientset.Interface, l *listers) *buildReconciler {
 	return &buildReconciler{
-		mcfgclient: mcfgclient,
-		kubeclient: kubeclient,
-		listers:    l,
+		mcfgclient:             mcfgclient,
+		kubeclient:             kubeclient,
+		pipelineoperatorclient: pipelineoperatorclient,
+		olmclient:              olmclient,
+		tektonclient:		tektonclient,
+		listers:                l,
 	}
 }
 
@@ -103,10 +120,214 @@ func (b *buildReconciler) updateMachineOSConfig(ctx context.Context, old, cur *m
 	// Whenever the build inputs have changed, create a new MachineOSBuild.
 	if !equality.Semantic.DeepEqual(old.Spec.BuildInputs, cur.Spec.BuildInputs) {
 		klog.Infof("Detected MachineOSConfig change for %s", cur.Name)
+
+		if cur.Spec.BuildInputs.ImageBuilder.ImageBuilderType == mcfgv1alpha1.PipelineBuilder {
+			// Check and install pipeline
+			err := checkAndInstallPipeline(ctx, b.kubeclient, b.pipelineoperatorclient, b.olmclient, b.tektonclient)
+			if err != nil {
+				return fmt.Errorf("error checking pipeline exists and installing: %v", err)
+			}
+		}
+
 		return b.createNewMachineOSBuildOrReuseExisting(ctx, cur)
 	}
 
 	return b.syncMachineOSConfigs(ctx)
+}
+
+func checkAndInstallPipeline(ctx context.Context, kubeclient clientset.Interface, pipelineoperatorclient pipelineoperatorclientset.Interface, olmclient olmclientset.Interface, tektonclient tektonclientset.Interface) error {
+	tektonNamespace := "openshift-pipelines"
+	operatorsNamespace := "openshift-operators"
+	tektonConfigName := "config"
+	subscriptionName := "openshift-pipelines-operator"
+	tektonPipelineName := "build-and-push-pipeline"
+	tektonClusterTaskName := "buildah"
+	var namespaceDNE, tektonconfigDNE, tektonPipelineDNE bool = false, false, false
+	
+	// Ensure "openshift-pipelines" Namespace exists
+	_, err := kubeclient.CoreV1().Namespaces().Get(ctx, tektonNamespace, metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			namespaceDNE = true
+		} else {
+			return fmt.Errorf("openshift-pipelines namespace get error %v", err)
+		}
+	}
+
+	// Ensure TektonConfig exists
+	_, err = pipelineoperatorclient.OperatorV1alpha1().TektonConfigs().Get(ctx, tektonConfigName, metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			tektonconfigDNE = true
+		} else {
+			return fmt.Errorf("tektonConfig resource get error %v", err)
+		}
+	}
+	if namespaceDNE || tektonconfigDNE {
+		// Define the Subscription resource
+		subscription := &olmv1alpha1.Subscription{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "operators.coreos.com/v1alpha1",
+				Kind:       "Subscription",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      subscriptionName,
+				Namespace: "openshift-operators",
+			},
+			Spec: &olmv1alpha1.SubscriptionSpec{
+				Channel:                "latest",
+				Package:                "openshift-pipelines-operator-rh",
+				CatalogSource:          "redhat-operators",
+				CatalogSourceNamespace: "openshift-marketplace",
+			},
+		}
+		_, err = olmclient.OperatorsV1alpha1().Subscriptions(operatorsNamespace).Create(ctx, subscription, metav1.CreateOptions{})
+		if err != nil {
+			if k8serrors.IsAlreadyExists(err) {
+				klog.V(2).Infof("%v already exists", subscriptionName)
+			} else {
+				return fmt.Errorf("subscription resource create error %v", err)
+			}
+		}
+	}
+	interval := 1 * time.Minute
+	timeout := 20 * time.Minute
+	err = waitForTektonConfigReady(ctx, pipelineoperatorclient, tektonNamespace, tektonConfigName, interval, timeout)
+	if err != nil {
+		return err
+	}
+
+	/*
+	// Ensure Buildah Task exists
+	// Potential problem: ClusterTasks don't exist in V1 API hence the Buildah task may need to be installed into MCO Namespace
+	_, err = tektonclient.TektonV1().Tasks(ctrlcommon.MCONamespace).Get(ctx, tektonClusterTaskName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("Error getting ClusterTask Buildah: %v", err)
+	}
+	*/
+
+	// Ensure Buildah Pipeline exists
+	_, err = tektonclient.TektonV1beta1().Pipelines(ctrlcommon.MCONamespace).Get(context.Background(), tektonPipelineName, metav1.GetOptions{})
+	if err != nil { 
+		if k8serrors.IsNotFound(err) {
+			tektonPipelineDNE = true
+			klog.V(2).Infof("Buildah pipeline DNE, creating")
+		} else {
+			return fmt.Errorf("Error getting Pipeline: %v", err)
+		}
+	}
+
+	if tektonPipelineDNE {
+		// TODO(rsaini) Define the pipeline "buildAndPush" here and create an API object here. Check if it already exists before
+		pipeline := &tektonv1beta1.Pipeline{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      tektonPipelineName,
+				Namespace: ctrlcommon.MCONamespace,
+			},
+			Spec: tektonv1beta1.PipelineSpec{
+				Params: []tektonv1beta1.ParamSpec{
+					tektonv1beta1.ParamSpec{Name: "logLevel", Type: tektonv1beta1.ParamTypeString, Description: "log level"},
+					tektonv1beta1.ParamSpec{Name: "storageDriver", Type: tektonv1beta1.ParamTypeString, Description: "storage driver"},
+					tektonv1beta1.ParamSpec{Name: "authfileBuild", Type: tektonv1beta1.ParamTypeString, Description: "authfileBuild"},
+					tektonv1beta1.ParamSpec{Name: "authfilePush", Type: tektonv1beta1.ParamTypeString, Description: "authfilePush"},
+					tektonv1beta1.ParamSpec{Name: "tag", Type: tektonv1beta1.ParamTypeString, Description: "Image URL"},
+					tektonv1beta1.ParamSpec{Name: "containerFile", Type: tektonv1beta1.ParamTypeString, Description: "container file"},
+					tektonv1beta1.ParamSpec{Name: "httpProxy", Type: tektonv1beta1.ParamTypeString, Description: "httpproxy", Default: &tektonv1beta1.ArrayOrString{Type: tektonv1beta1.ParamTypeString, StringVal: ""}},
+					tektonv1beta1.ParamSpec{Name: "httpsProxy", Type: tektonv1beta1.ParamTypeString, Description: "httpsproxy", Default: &tektonv1beta1.ArrayOrString{Type: tektonv1beta1.ParamTypeString, StringVal: ""}},
+					tektonv1beta1.ParamSpec{Name: "noProxy", Type: tektonv1beta1.ParamTypeString, Description: "noproxy", Default: &tektonv1beta1.ArrayOrString{Type: tektonv1beta1.ParamTypeString, StringVal: ""}},
+					tektonv1beta1.ParamSpec{Name: "buildContext", Type: tektonv1beta1.ParamTypeString, Description: "context"},
+					tektonv1beta1.ParamSpec{Name: "image", Type: tektonv1beta1.ParamTypeString, Description: "image"},
+					tektonv1beta1.ParamSpec{Name: "machineConfig", Type: tektonv1beta1.ParamTypeString, Description: "machine config"},
+					tektonv1beta1.ParamSpec{Name: "additionalTrustBundle", Type: tektonv1beta1.ParamTypeString, Description: "additional trust bundle"},
+				},
+				Results: []tektonv1beta1.PipelineResult{
+					tektonv1beta1.PipelineResult{Name: "IMAGE_DIGEST", Type: tektonv1beta1.ResultsTypeString, Description: "Digest of the image just built", Value: tektonv1beta1.ArrayOrString{Type: tektonv1beta1.ParamTypeString, StringVal: "$(tasks.buildah-build.results.IMAGE_DIGEST)"}},
+					tektonv1beta1.PipelineResult{Name: "IMAGE_URL", Type: tektonv1beta1.ResultsTypeString, Description: "Image repository where the built image would be pushed to", Value: tektonv1beta1.ArrayOrString{Type: tektonv1beta1.ParamTypeString, StringVal: "$(tasks.buildah-build.results.IMAGE_URL)"}},
+				},
+				Workspaces: []tektonv1beta1.PipelineWorkspaceDeclaration{
+					tektonv1beta1.PipelineWorkspaceDeclaration{Name: "source"},
+				},
+				Tasks: []tektonv1beta1.PipelineTask{
+					tektonv1beta1.PipelineTask{
+						Name: "prepare-environment",
+						TaskSpec: &tektonv1beta1.EmbeddedTask{
+							TaskSpec: tektonv1beta1.TaskSpec{
+								Workspaces: []tektonv1beta1.WorkspaceDeclaration{
+									tektonv1beta1.WorkspaceDeclaration{
+										Name: "source",
+									},
+								},
+								Steps: []tektonv1beta1.Step{
+									tektonv1beta1.Step{
+										Name:  "setup-environment",
+										Image: "$(params.image)",
+										Script: buildahBuildPipelineScript,
+									},
+								},
+							},
+						},
+						Workspaces: []tektonv1beta1.WorkspacePipelineTaskBinding{
+							tektonv1beta1.WorkspacePipelineTaskBinding{Name: "source", Workspace: "source"},
+						},
+					},
+					tektonv1beta1.PipelineTask{
+						Name: "buildah-build",
+						TaskRef: &tektonv1beta1.TaskRef{
+							ResolverRef: tektonv1beta1.ResolverRef{
+								Resolver: "cluster",
+								Params: []tektonv1beta1.Param{
+									{Name: "name", Value: tektonv1beta1.ArrayOrString{Type: tektonv1beta1.ParamTypeString, StringVal: tektonClusterTaskName}},
+									{Name: "namespace", Value: tektonv1beta1.ArrayOrString{Type: tektonv1beta1.ParamTypeString, StringVal: tektonNamespace}},
+									{Name: "kind", Value: tektonv1beta1.ArrayOrString{Type: tektonv1beta1.ParamTypeString, StringVal: "task"}},
+								},
+							},
+						},
+						Params: []tektonv1beta1.Param{
+							tektonv1beta1.Param{Name: "IMAGE", Value: tektonv1beta1.ArrayOrString{Type: tektonv1beta1.ParamTypeString, StringVal: "$(params.tag)"}},
+							tektonv1beta1.Param{Name: "STORAGE_DRIVER", Value: tektonv1beta1.ArrayOrString{Type: tektonv1beta1.ParamTypeString, StringVal: "$(params.storageDriver)"}},
+							tektonv1beta1.Param{Name: "DOCKERFILE", Value: tektonv1beta1.ArrayOrString{Type: tektonv1beta1.ParamTypeString, StringVal: "$(params.containerFile)"}},
+							tektonv1beta1.Param{Name: "CONTEXT", Value: tektonv1beta1.ArrayOrString{Type: tektonv1beta1.ParamTypeString, StringVal: "$(params.buildContext)"}},
+							tektonv1beta1.Param{Name: "BUILD_EXTRA_ARGS", Value: tektonv1beta1.ArrayOrString{Type: tektonv1beta1.ParamTypeString, StringVal: "--authfile=$(params.authfileBuild) --log-level=$(params.logLevel)"}},
+							tektonv1beta1.Param{Name: "BUILD_ARGS", Value: tektonv1beta1.ParamValue{Type: tektonv1beta1.ParamTypeArray, ArrayVal: []string{"HTTP_PROXY=$(params.httpProxy)", "HTTPS_PROXY=$(params.httpsProxy)", "NO_PROXY=$(params.noProxy)"}}},
+							tektonv1beta1.Param{Name: "PUSH_EXTRA_ARGS", Value: tektonv1beta1.ArrayOrString{Type: tektonv1beta1.ParamTypeString, StringVal: "--authfile=$(params.authfilePush)"}},
+						},
+						Workspaces: []tektonv1beta1.WorkspacePipelineTaskBinding{
+							tektonv1beta1.WorkspacePipelineTaskBinding{Name: "source", Workspace: "source"},
+						},
+					},
+				},
+			},
+		}
+
+		_, err = tektonclient.TektonV1beta1().Pipelines(ctrlcommon.MCONamespace).Create(context.Background(), pipeline, metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("Error creating Pipeline: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// waitForTektonConfigReady waits for the TektonConfig's Ready condition to become True.
+func waitForTektonConfigReady(ctx context.Context, client pipelineoperatorclientset.Interface, namespace, name string, interval, timeout time.Duration) error {
+	return wait.PollUntilContextCancel(ctx, interval, true, func(ctx context.Context) (bool, error) {
+		// Fetch the TektonConfig resource
+		tektonConfig, err := client.OperatorV1alpha1().TektonConfigs().Get(ctx, name, metav1.GetOptions{})
+		if err != nil { 
+			if k8serrors.IsNotFound(err) {
+				klog.V(2).Infof("trying to read tektonconfig in waitForTektonConfigReady")
+				return false, nil
+			} else {
+				return false, fmt.Errorf("failed to fetch TektonConfig: %v", err)
+			}
+		}
+		// Check if the Ready condition is True
+		readyCondition := tektonConfig.Status.GetCondition(apis.ConditionReady)
+		if readyCondition != nil && readyCondition.Status == "True" {
+			return true, nil
+		}
+		return false, nil
+	})
 }
 
 // Rebuilds the most current build associated with a MachineOSConfig whenever
@@ -143,6 +364,13 @@ func (b *buildReconciler) rebuildMachineOSConfig(ctx context.Context, mosc *mcfg
 // Runs whenever a new MachineOSConfig is added. Determines if a new
 // MachineOSBuild should be created and then creates it, if needed.
 func (b *buildReconciler) addMachineOSConfig(ctx context.Context, mosc *mcfgv1alpha1.MachineOSConfig) error {
+	if mosc.Spec.BuildInputs.ImageBuilder.ImageBuilderType == mcfgv1alpha1.PipelineBuilder {
+		// Check and install pipeline
+		err := checkAndInstallPipeline(ctx, b.kubeclient, b.pipelineoperatorclient, b.olmclient, b.tektonclient)
+		if err != nil {
+			return fmt.Errorf("error checking pipeline exists and installing: %v", err)
+		}
+	}
 	return b.syncMachineOSConfig(ctx, mosc)
 }
 
@@ -258,7 +486,7 @@ func (b *buildReconciler) updateMachineOSBuild(ctx context.Context, old, current
 	// final image pushspec onto the MachineOSConfig object.
 	if !oldState.IsBuildSuccess() && curState.IsBuildSuccess() {
 		klog.Infof("MachineOSBuild %s succeeded, cleaning up all ephemeral objects used for the build", current.Name)
-		if err := imagebuilder.NewJobImageBuilder(b.kubeclient, b.mcfgclient, current, mosc).Clean(ctx); err != nil {
+		if err := imagebuilder.NewJobImageBuilder(b.kubeclient, b.mcfgclient, b.tektonclient, current, mosc).Clean(ctx); err != nil {
 			return err
 		}
 
@@ -372,12 +600,21 @@ func (b *buildReconciler) startBuild(ctx context.Context, mosb *mcfgv1alpha1.Mac
 		return fmt.Errorf("could not delete other non-terminal MachineOSBuilds for MachineOSConfig %s: %w", mosc.Name, err)
 	}
 
-	// Next, create our new MachineOSBuild.
-	if err := imagebuilder.NewJobImageBuilder(b.kubeclient, b.mcfgclient, mosb, mosc).Start(ctx); err != nil {
-		return fmt.Errorf("imagebuilder could not start build for MachineOSBuild %q: %w", mosb.Name, err)
+	switch mosc.Spec.BuildInputs.ImageBuilder.ImageBuilderType {
+	case mcfgv1alpha1.PodBuilder:
+		// Next, create our new MachineOSBuild.
+		if err := imagebuilder.NewJobImageBuilder(b.kubeclient, b.mcfgclient, b.tektonclient, mosb, mosc).Start(ctx); err != nil {
+			return fmt.Errorf("imagebuilder could not start build for MachineOSBuild %q: %w", mosb.Name, err)
+		}
+	case mcfgv1alpha1.PipelineBuilder:
+		if err := imagebuilder.NewPipelineImageBuilder(b.kubeclient, b.mcfgclient, b.tektonclient, mosb, mosc).Start(ctx); err != nil {
+			return fmt.Errorf("imagebuilder could not start build for MachineOSBuild %q: %w", mosb.Name, err)
+		}
+	default:
+		return fmt.Errorf("ImageBuilderType: %s is not supported", mosc.Spec.BuildInputs.ImageBuilder.ImageBuilderType)
 	}
 
-	klog.Infof("Started new build %s for MachineOSBuild", utils.GetBuildJobName(mosb))
+	klog.Infof("Started new build %s for MachineOSBuild", utils.GetBuildName(mosb))
 
 	if err := b.updateMachineOSConfigStatus(ctx, mosc, mosb); err != nil {
 		return fmt.Errorf("could not update MachineOSConfig %q status for MachineOSBuild %q: %w", mosc.Name, mosb.Name, err)
@@ -538,7 +775,7 @@ func (b *buildReconciler) getMachineOSBuildStatusForBuilder(ctx context.Context,
 		return mcfgv1alpha1.MachineOSBuildStatus{}, nil, fmt.Errorf("could not get MachineOSConfig or MachineOSBuild for builder: %w", err)
 	}
 
-	observer := imagebuilder.NewJobImageBuildObserverFromBuilder(b.kubeclient, b.mcfgclient, mosb, mosc, builder)
+	observer := imagebuilder.NewJobImageBuildObserverFromBuilder(b.kubeclient, b.mcfgclient, b.tektonclient, mosb, mosc, builder)
 
 	status, err := observer.MachineOSBuildStatus(ctx)
 	if err != nil {
@@ -711,7 +948,7 @@ func (b *buildReconciler) getMachineOSConfigForBuilder(builder buildrequest.Buil
 
 // Deletes the underlying build objects for a given MachineOSBuild.
 func (b *buildReconciler) deleteBuilderForMachineOSBuild(ctx context.Context, mosb *mcfgv1alpha1.MachineOSBuild) error {
-	if err := imagebuilder.NewJobImageBuildCleaner(b.kubeclient, b.mcfgclient, mosb).Clean(ctx); err != nil {
+	if err := imagebuilder.NewJobImageBuildCleaner(b.kubeclient, b.mcfgclient, b.tektonclient, mosb).Clean(ctx); err != nil {
 		return fmt.Errorf("could not clean build %s: %w", mosb.Name, err)
 	}
 
@@ -900,7 +1137,16 @@ func (b *buildReconciler) syncMachineOSBuild(ctx context.Context, mosb *mcfgv1al
 				return ignoreErrIsNotFound(fmt.Errorf("could not sync MachineOSBuild %q: %w", mosb.Name, err))
 			}
 
-			observer := imagebuilder.NewJobImageBuildObserver(b.kubeclient, b.mcfgclient, mosb, mosc)
+			if mosc.Spec.BuildInputs.ImageBuilder.ImageBuilderType == mcfgv1alpha1.PipelineBuilder {
+				// Check and install pipeline
+				err := checkAndInstallPipeline(ctx, b.kubeclient, b.pipelineoperatorclient, b.olmclient, b.tektonclient)
+				if err != nil {
+					return fmt.Errorf("error checking pipeline exists and installing: %v", err)
+				}
+			}
+
+
+			observer := imagebuilder.NewJobImageBuildObserver(b.kubeclient, b.mcfgclient, b.tektonclient, mosb, mosc)
 
 			exists, err := observer.Exists(ctx)
 			if err != nil {
@@ -956,6 +1202,15 @@ func (b *buildReconciler) syncMachineOSConfig(ctx context.Context, mosc *mcfgv1a
 		if err != nil {
 			return fmt.Errorf("could not list MachineOSBuilds for MachineOSConfig %q: %w", mosc.Name, err)
 		}
+
+		if mosc.Spec.BuildInputs.ImageBuilder.ImageBuilderType == mcfgv1alpha1.PipelineBuilder {
+			// Check and install pipeline
+			err := checkAndInstallPipeline(ctx, b.kubeclient, b.pipelineoperatorclient, b.olmclient, b.tektonclient)
+			if err != nil {
+				return fmt.Errorf("error checking pipeline exists and installing: %v", err)
+			}
+		}
+
 
 		klog.V(4).Infof("MachineOSConfig %q is associated with %d MachineOSBuilds %v", mosc.Name, len(mosbs), getMachineOSBuildNames(mosbs))
 
